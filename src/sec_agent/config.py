@@ -1,5 +1,8 @@
 import os
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+
+load_dotenv()
 
 
 def _env_bool(name: str, default: bool) -> bool:
