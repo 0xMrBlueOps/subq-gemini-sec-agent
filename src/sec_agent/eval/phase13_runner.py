@@ -29,7 +29,6 @@ from sec_agent.gateway import (
 )
 from sec_agent.orchestrator import TriageOrchestrator
 from sec_agent.schemas import (
-    GeminiInvestigationResult,
     SecurityEvent,
     SeverityLevel,
     SubQTriageResult,
@@ -66,17 +65,21 @@ class _SharedPacer:
             self._last_request_ts = time.monotonic()
 
 
-class _ScopedIdempotencyTransport(httpx.AsyncBaseTransport):
-    """Scopes X-Idempotency-Key HTTP header per (run_id, case_id, opaque_mode) without premature pool close."""
+class _PacedTransport(httpx.AsyncBaseTransport):
+    """Enforces shared pacing on every outbound HTTP attempt without premature pool closure."""
 
-    def __init__(self, inner: httpx.AsyncBaseTransport | None = None) -> None:
+    def __init__(
+        self,
+        inner: httpx.AsyncBaseTransport | None = None,
+        pacer: _SharedPacer | None = None,
+    ) -> None:
         self._inner = inner or httpx.AsyncHTTPTransport()
-        self.current_scope_key: str | None = None
+        self._pacer = pacer
         self.underlying_closed: bool = False
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        if self.current_scope_key:
-            request.headers["X-Idempotency-Key"] = self.current_scope_key
+        if self._pacer is not None:
+            await self._pacer.wait_turn()
         return await self._inner.handle_async_request(request)
 
     async def aclose(self) -> None:
@@ -89,8 +92,27 @@ class _ScopedIdempotencyTransport(httpx.AsyncBaseTransport):
             self.underlying_closed = True
 
 
+class _ScopedIdempotencyTransport(_PacedTransport):
+    """Paced transport that also scopes SubQ X-Idempotency-Key per (run_id, case_id, opaque_mode)."""
+
+    def __init__(
+        self,
+        inner: httpx.AsyncBaseTransport | None = None,
+        pacer: _SharedPacer | None = None,
+    ) -> None:
+        super().__init__(inner=inner, pacer=pacer)
+        self.current_scope_key: str | None = None
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if self._pacer is not None:
+            await self._pacer.wait_turn()
+        if self.current_scope_key:
+            request.headers["X-Idempotency-Key"] = self.current_scope_key
+        return await self._inner.handle_async_request(request)
+
+
 class _ScopedDecisionWrapper(DecisionModelClient):
-    """Sets opaque per-request idempotency scope and enforces shared pacing while keeping event_id neutral."""
+    """Sets opaque per-request idempotency scope while keeping event_id neutral."""
 
     def __init__(
         self,
@@ -98,33 +120,16 @@ class _ScopedDecisionWrapper(DecisionModelClient):
         transport: _ScopedIdempotencyTransport | None,
         run_id: str,
         mode: str,
-        pacer: _SharedPacer | None = None,
     ) -> None:
         self._client = client
         self._transport = transport
         self._run_id = run_id
         self._opaque_mode = _OPAQUE_MODE_IDS[mode]
-        self._pacer = pacer
 
     async def triage_event(self, event: SecurityEvent, isolated_log: str) -> SubQTriageResult:
-        if self._pacer is not None:
-            await self._pacer.wait_turn()
         if self._transport is not None:
             self._transport.current_scope_key = f"{self._run_id}:{event.event_id}:{self._opaque_mode}"
         return await self._client.triage_event(event, isolated_log)
-
-
-class _PacedReasoningWrapper(ReasoningModelClient):
-    """Enforces shared pacing before every outbound Gemini investigation request."""
-
-    def __init__(self, client: ReasoningModelClient, pacer: _SharedPacer | None = None) -> None:
-        self._client = client
-        self._pacer = pacer
-
-    async def investigate_event(self, event: SecurityEvent, isolated_log: str) -> GeminiInvestigationResult:
-        if self._pacer is not None:
-            await self._pacer.wait_turn()
-        return await self._client.investigate_event(event, isolated_log)
 
 
 def _is_malicious(cat: ThreatCategory) -> bool:
@@ -225,17 +230,34 @@ def _append_phase13_report_section(
             f"{st['coverage_rate']} | {st['honest_recall']} | {st['honest_fnr']} | {st['honest_fpr']} | {st['honest_escalation_recall']} |"
         )
 
+    benign_attempted = routing_stats.get("benign_attempted", 0)
     benign_completed = routing_stats.get("benign_completed", 0)
-    fast_path = routing_stats.get("subq_fast_path", 0)
+    benign_fast_path = routing_stats.get("benign_fast_path", 0)
+    malicious_fast_path = routing_stats.get("malicious_fast_path", 0)
     gemini_esc = routing_stats.get("escalated_to_gemini", 0)
-    fast_pct = round((fast_path / benign_completed) * 100.0, 2) if benign_completed else 0.0
+    fast_pct_attempted = round((benign_fast_path / benign_attempted) * 100.0, 2) if benign_attempted else 0.0
+    fast_pct_completed = round((benign_fast_path / benign_completed) * 100.0, 2) if benign_completed else 0.0
+    routing_lines = [
+        "",
+        "### Routing Efficiency (`routed` mode)",
+        f"- **Benign Attempted:** {benign_attempted}",
+        f"- **Benign Completed:** {benign_completed}",
+        f"- **Benign Fast-Path Count:** {benign_fast_path}",
+        f"- **Malicious Fast-Path Count:** {malicious_fast_path}",
+        f"- **Gemini Escalation Count:** {gemini_esc}",
+        f"- **Benign Fast-Path Rate (attempted benign):** {fast_pct_attempted}% ({benign_fast_path}/{benign_attempted})",
+    ]
+    if benign_completed != benign_attempted:
+        routing_lines.append(
+            f"- **Benign Fast-Path Rate (completed benign only):** {fast_pct_completed}% ({benign_fast_path}/{benign_completed})"
+        )
+    if malicious_fast_path > 0:
+        routing_lines.append(
+            f"- **WARNING — MALICIOUS FAST-PATH BYPASS:** {malicious_fast_path} malicious case(s) took `subq_fast_path` without Gemini escalation."
+        )
     lines.extend(
-        [
-            "",
-            "### Routing Efficiency (`routed` mode)",
-            f"- **SubQ Fast-Path Count:** {fast_path}",
-            f"- **Gemini Escalation Count:** {gemini_esc}",
-            f"- **Benign Fast-Path Rate (among completed benign cases):** {fast_pct}% ({fast_path}/{benign_completed})",
+        routing_lines
+        + [
             "",
             "### Failed-Case Metric Policy",
             "- Provider exceptions are logged to `errors.jsonl` and excluded from genuine model-latency/cost averages, "
@@ -267,7 +289,8 @@ async def run_phase13_evaluation(
     run_dir = Path(output_base) / f"phase13_{exec_type}_{run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    scoped_subq_transport = None if use_mock else _ScopedIdempotencyTransport(subq_transport)
+    scoped_subq_transport = None if use_mock else _ScopedIdempotencyTransport(subq_transport, pacer=pacer)
+    paced_gemini_transport = None if use_mock else _PacedTransport(gemini_transport, pacer=pacer)
     if use_mock:
         base_subq: DecisionModelClient = MockSubQSnapClient()
         base_gemini: ReasoningModelClient = MockGeminiHydrogenClient()
@@ -283,23 +306,28 @@ async def run_phase13_evaluation(
             model_id=cfg.gemini_model_id,
             base_url=cfg.gemini_base_url,
             thinking_level=cfg.gemini_thinking_level,
-            transport=gemini_transport,
+            transport=paced_gemini_transport,
         )
-
-    paced_gemini = _PacedReasoningWrapper(base_gemini, pacer=pacer)
 
     cases: list[Phase13TestCase] = build_phase13_dataset()[:max_cases]
     all_records: list[CaseEvalRecord] = []
     error_records: list[dict[str, str]] = []
     summaries: dict[str, ModeMetrics] = {}
     honest_stats: list[dict[str, Any]] = []
-    routing_stats = {"subq_fast_path": 0, "escalated_to_gemini": 0, "benign_completed": 0}
+    routing_stats = {
+        "benign_attempted": sum(1 for c in cases if not c.expected_malicious),
+        "benign_completed": 0,
+        "benign_fast_path": 0,
+        "malicious_fast_path": 0,
+        "subq_fast_path": 0,
+        "escalated_to_gemini": 0,
+    }
 
     try:
         # 1. subq_only
         subq_recs: list[CaseEvalRecord] = []
         subq_failed: list[Phase13TestCase] = []
-        scoped_subq_only = _ScopedDecisionWrapper(base_subq, scoped_subq_transport, run_id, "subq_only", pacer=pacer)
+        scoped_subq_only = _ScopedDecisionWrapper(base_subq, scoped_subq_transport, run_id, "subq_only")
         for tc in cases:
             try:
                 san = isolate_untrusted_log(tc.event.raw_log)
@@ -343,7 +371,7 @@ async def run_phase13_evaluation(
         for tc in cases:
             try:
                 san = isolate_untrusted_log(tc.event.raw_log)
-                res = await paced_gemini.investigate_event(tc.event, san.isolated_text)
+                res = await base_gemini.investigate_event(tc.event, san.isolated_text)
                 gem_recs.append(
                     CaseEvalRecord(
                         case_id=tc.case_id,
@@ -382,8 +410,8 @@ async def run_phase13_evaluation(
         comb_recs: list[CaseEvalRecord] = []
         comb_failed: list[Phase13TestCase] = []
         comb_orch = TriageOrchestrator(
-            decision_client=_ScopedDecisionWrapper(base_subq, scoped_subq_transport, run_id, "combined", pacer=pacer),
-            reasoning_client=paced_gemini,
+            decision_client=_ScopedDecisionWrapper(base_subq, scoped_subq_transport, run_id, "combined"),
+            reasoning_client=base_gemini,
             audit_logger=AuditLogger(run_dir / "audit_combined.jsonl"),
             enable_intelligent_routing=False,
             deduplicate_events=True,
@@ -436,8 +464,8 @@ async def run_phase13_evaluation(
         routed_recs: list[CaseEvalRecord] = []
         routed_failed: list[Phase13TestCase] = []
         routed_orch = TriageOrchestrator(
-            decision_client=_ScopedDecisionWrapper(base_subq, scoped_subq_transport, run_id, "routed", pacer=pacer),
-            reasoning_client=paced_gemini,
+            decision_client=_ScopedDecisionWrapper(base_subq, scoped_subq_transport, run_id, "routed"),
+            reasoning_client=base_gemini,
             audit_logger=AuditLogger(run_dir / "audit_routed.jsonl"),
             routing_policy=RoutingPolicy(
                 escalate_threshold=cfg.routing_escalate_threshold,
@@ -454,12 +482,16 @@ async def run_phase13_evaluation(
         for tc in cases:
             try:
                 asm = await routed_orch.process_event(tc.event)
-                if asm.routing_decision == "subq_fast_path":
-                    routing_stats["subq_fast_path"] += 1
-                else:
-                    routing_stats["escalated_to_gemini"] += 1
                 if not tc.expected_malicious:
                     routing_stats["benign_completed"] += 1
+                if asm.routing_decision == "subq_fast_path":
+                    routing_stats["subq_fast_path"] += 1
+                    if tc.expected_malicious:
+                        routing_stats["malicious_fast_path"] += 1
+                    else:
+                        routing_stats["benign_fast_path"] += 1
+                else:
+                    routing_stats["escalated_to_gemini"] += 1
 
                 g_lat = asm.gemini_result.latency_ms if asm.gemini_result else 0.0
                 g_in = asm.gemini_result.input_tokens if asm.gemini_result else 0
@@ -557,8 +589,9 @@ async def run_phase13_evaluation(
             "errors": error_records,
         }
     finally:
-        if scoped_subq_transport is not None:
-            await scoped_subq_transport.close_underlying()
+        for tr in (scoped_subq_transport, paced_gemini_transport):
+            if tr is not None:
+                await tr.close_underlying()
 
 
 def main(argv: list[str] | None = None) -> int:

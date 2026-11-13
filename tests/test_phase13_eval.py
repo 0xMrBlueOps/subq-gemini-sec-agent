@@ -75,7 +75,8 @@ class TestPhase13Evaluation(unittest.TestCase):
             run_dir = Path(res["run_dir"])
             md = (run_dir / "PHASE13_REPORT.md").read_text(encoding="utf-8")
             self.assertIn("Phase 13 Evaluation Integrity & Routing Summary", md)
-            self.assertIn("SubQ Fast-Path Count", md)
+            self.assertIn("Benign Fast-Path Count", md)
+            self.assertIn("Malicious Fast-Path Count", md)
             self.assertIn("Gemini Escalation Count", md)
             self.assertIn("Benign Fast-Path Rate", md)
             self.assertEqual(p13_main(["--output-base", tmp, "--max-cases", "4"]), 0)
@@ -172,14 +173,142 @@ class TestPhase13Evaluation(unittest.TestCase):
 
     def test_retries_preserve_same_idempotency_key_and_live_pacing_fires_between_calls(self) -> None:
         seen_keys: list[str] = []
-        attempts = {"n": 0}
+        gem_headers: list[dict[str, str]] = []
+        subq_attempts = {"n": 0}
+        gem_attempts = {"n": 0}
         sleep_calls: list[float] = []
 
         def subq_handler(request: httpx.Request) -> httpx.Response:
             seen_keys.append(request.headers["X-Idempotency-Key"])
-            attempts["n"] += 1
-            if attempts["n"] == 1:
+            subq_attempts["n"] += 1
+            if subq_attempts["n"] == 1:
                 return httpx.Response(429, headers={"Retry-After": "0.01"}, text="rate limited")
+            return httpx.Response(
+                200,
+                json={
+                    "model": "subq-snap-1.2",
+                    "answers": {
+                        "category": {"choice": "benign", "probabilities": {"benign": 0.95}, "confidence": 0.95},
+                        "severity": {"score": 0.0, "confidence": 0.95},
+                        "escalate": {"noul": 0.05},
+                        "prompt_injection": {"noul": 0.01},
+                    },
+                    "usage": {"input_tokens": 100},
+                },
+            )
+
+        def gem_handler(request: httpx.Request) -> httpx.Response:
+            gem_headers.append({k.lower(): v for k, v in request.headers.items()})
+            gem_attempts["n"] += 1
+            if gem_attempts["n"] == 1:
+                return httpx.Response(429, headers={"Retry-After": "0.02"}, text="gemini rate limited")
+            return httpx.Response(
+                200,
+                json={
+                    "candidates": [
+                        {
+                            "finishReason": "STOP",
+                            "content": {
+                                "parts": [
+                                    {
+                                        "text": json.dumps(
+                                            {
+                                                "category": "benign",
+                                                "severity": "low",
+                                                "summary": "ok",
+                                                "indicators_of_compromise": [],
+                                                "recommended_actions": [],
+                                                "uncertainty_notes": [],
+                                                "confidence": 0.9,
+                                            }
+                                        )
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                    "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 20, "thoughtsTokenCount": 5},
+                },
+            )
+
+        orig_sleep = asyncio.sleep
+
+        async def fake_sleep(delay: float) -> None:
+            sleep_calls.append(delay)
+            await orig_sleep(0)
+
+        subq_tr = _TrackingTransport(subq_handler)
+        gem_tr = _TrackingTransport(gem_handler)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Settings(subq_api_key="test-subq", gemini_api_key="test-gem", use_mock_models=False)
+            with patch("sec_agent.eval.phase13_runner.asyncio.sleep", side_effect=fake_sleep):
+                asyncio.run(
+                    run_phase13_evaluation(
+                        output_base=tmp,
+                        use_mock=False,
+                        max_cases=1,
+                        delay_seconds=1.5,
+                        settings=cfg,
+                        subq_transport=subq_tr,
+                        gemini_transport=gem_tr,
+                    )
+                )
+        # First 2 keys are the retry pair for subq_only p13_evt_01 and must be identical
+        self.assertEqual(seen_keys[0], seen_keys[1])
+        # Distinct modes must have distinct keys
+        self.assertNotEqual(seen_keys[0], seen_keys[2])
+        # Gemini requests must NEVER receive SubQ idempotency headers
+        for hdrs in gem_headers:
+            self.assertNotIn("x-idempotency-key", hdrs)
+        # Total outbound HTTP requests = 4 SubQ (3 + 1 retry) + 3 Gemini (2 + 1 retry) = 7
+        # So shared pacer must fire 6 times (>= 1.4s each), including SubQ retry, Gemini retry, and SubQ->Gemini transitions
+        pacer_sleeps = [d for d in sleep_calls if d > 1.0]
+        self.assertEqual(len(pacer_sleeps), 6)
+        self.assertIn(0.01, sleep_calls)
+        self.assertIn(0.02, sleep_calls)
+        # Both underlying transports closed exactly once
+        self.assertTrue(subq_tr.closed)
+        self.assertEqual(subq_tr.aclose_calls, 1)
+        self.assertTrue(gem_tr.closed)
+        self.assertEqual(gem_tr.aclose_calls, 1)
+
+    def test_underlying_transport_closed_on_unexpected_exception(self) -> None:
+        subq_tr = _TrackingTransport(lambda _: httpx.Response(200, json={}))
+        gem_tr = _TrackingTransport(lambda _: httpx.Response(200, json={}))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Settings(subq_api_key="test-subq", gemini_api_key="test-gem", use_mock_models=False)
+            with patch(
+                "sec_agent.eval.phase13_runner._compute_honest_mode_stats",
+                side_effect=RuntimeError("boom"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    asyncio.run(
+                        run_phase13_evaluation(
+                            output_base=tmp,
+                            use_mock=False,
+                            max_cases=1,
+                            delay_seconds=0.0,
+                            settings=cfg,
+                            subq_transport=subq_tr,
+                            gemini_transport=gem_tr,
+                        )
+                    )
+        self.assertTrue(subq_tr.closed)
+        self.assertEqual(subq_tr.aclose_calls, 1)
+        self.assertTrue(gem_tr.closed)
+        self.assertEqual(gem_tr.aclose_calls, 1)
+
+    def test_malicious_fast_path_cannot_inflate_benign_fast_path_rate_and_failed_benign_visible(self) -> None:
+        # max_cases=7 -> p13_evt_01..06 are benign, p13_evt_07 is malicious.
+        # Fail p13_evt_01 (benign) with 422, let p13_evt_02..06 (benign) take fast path,
+        # and let p13_evt_07 (malicious) falsely take fast path too.
+        def subq_handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            ev_id = body["state"]["event_id"]
+            if ev_id == "p13_evt_01":
+                return httpx.Response(422, json={"detail": {"error_type": "validation_error", "message": "benign failed"}})
             return httpx.Response(
                 200,
                 json={
@@ -224,60 +353,40 @@ class TestPhase13Evaluation(unittest.TestCase):
                 },
             )
 
-        orig_sleep = asyncio.sleep
-
-        async def fake_sleep(delay: float) -> None:
-            sleep_calls.append(delay)
-            await orig_sleep(0)
+        from sec_agent.engine.router import RoutingDecision
 
         with tempfile.TemporaryDirectory() as tmp:
             cfg = Settings(subq_api_key="test-subq", gemini_api_key="test-gem", use_mock_models=False)
-            with patch("sec_agent.eval.phase13_runner.asyncio.sleep", side_effect=fake_sleep):
-                asyncio.run(
+            with patch(
+                "sec_agent.eval.phase13_runner.RoutingPolicy.decide",
+                return_value=RoutingDecision(invoke_gemini=False, decision_label="subq_fast_path", reasons=["simulated_fast_path"]),
+            ):
+                res = asyncio.run(
                     run_phase13_evaluation(
                         output_base=tmp,
                         use_mock=False,
-                        max_cases=1,
-                        delay_seconds=1.5,
+                        max_cases=7,
+                        delay_seconds=0.0,
                         settings=cfg,
                         subq_transport=httpx.MockTransport(subq_handler),
                         gemini_transport=httpx.MockTransport(gem_handler),
                     )
                 )
-        # First 2 keys are the retry pair for subq_only p13_evt_01 and must be identical
-        self.assertEqual(seen_keys[0], seen_keys[1])
-        # Distinct modes must have distinct keys
-        self.assertNotEqual(seen_keys[0], seen_keys[2])
-        # Shared pacer slept ~1.5s between consecutive provider calls (including SubQ -> Gemini),
-        # distinct from the 0.01s Retry-After sleep on the 429 retry.
-        pacer_sleeps = [d for d in sleep_calls if d > 1.0]
-        self.assertGreaterEqual(len(pacer_sleeps), 4)
-        self.assertIn(0.01, sleep_calls)
+            rs = res["routing_stats"]
+            self.assertEqual(rs["benign_attempted"], 6)
+            self.assertEqual(rs["benign_completed"], 5)
+            self.assertEqual(rs["benign_fast_path"], 5)
+            self.assertEqual(rs["malicious_fast_path"], 1)
 
-    def test_underlying_transport_closed_on_unexpected_exception(self) -> None:
-        subq_tr = _TrackingTransport(lambda _: httpx.Response(200, json={}))
-        gem_tr = httpx.MockTransport(lambda _: httpx.Response(200, json={}))
-
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg = Settings(subq_api_key="test-subq", gemini_api_key="test-gem", use_mock_models=False)
-            with patch(
-                "sec_agent.eval.phase13_runner._compute_honest_mode_stats",
-                side_effect=RuntimeError("boom"),
-            ):
-                with self.assertRaisesRegex(RuntimeError, "boom"):
-                    asyncio.run(
-                        run_phase13_evaluation(
-                            output_base=tmp,
-                            use_mock=False,
-                            max_cases=1,
-                            delay_seconds=0.0,
-                            settings=cfg,
-                            subq_transport=subq_tr,
-                            gemini_transport=gem_tr,
-                        )
-                    )
-        self.assertTrue(subq_tr.closed)
-        self.assertEqual(subq_tr.aclose_calls, 1)
+            md = (Path(res["run_dir"]) / "PHASE13_REPORT.md").read_text(encoding="utf-8")
+            self.assertIn("Benign Attempted:** 6", md)
+            self.assertIn("Benign Completed:** 5", md)
+            self.assertIn("Benign Fast-Path Count:** 5", md)
+            self.assertIn("Malicious Fast-Path Count:** 1", md)
+            # Must be 83.33% (5/6), NOT 120% (6/5) or 100% (5/5) as primary attempted rate
+            self.assertIn("Benign Fast-Path Rate (attempted benign):** 83.33% (5/6)", md)
+            self.assertIn("Benign Fast-Path Rate (completed benign only):** 100.0% (5/5)", md)
+            self.assertIn("WARNING — MALICIOUS FAST-PATH BYPASS", md)
 
 
 if __name__ == "__main__":
