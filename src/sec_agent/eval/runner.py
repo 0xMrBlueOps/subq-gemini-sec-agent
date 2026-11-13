@@ -6,7 +6,7 @@ from pathlib import Path
 
 from sec_agent.audit import AuditLogger
 from sec_agent.config import Settings
-from sec_agent.engine import RoutingPolicy
+from sec_agent.engine import RoutingPolicy, UncertaintyPolicy
 from sec_agent.eval.dataset import build_synthetic_dataset
 from sec_agent.eval.metrics import CaseEvalRecord, ModeMetrics, compute_mode_metrics
 from sec_agent.gateway import (
@@ -87,9 +87,11 @@ async def run_benchmark(
                 expected_escalate=tc.expected_escalate,
                 escalated=_should_escalate_single(res.severity, res.prompt_injection_probability)
                 or res.escalate_probability >= 0.6,
+                model_confidence=res.confidence,
                 latency_ms=res.latency_ms,
                 input_tokens=res.input_tokens,
                 output_tokens=0,
+                subq_input_tokens=res.input_tokens,
             )
         )
     summaries["subq_only"] = compute_mode_metrics(subq_records)
@@ -113,9 +115,13 @@ async def run_benchmark(
                 predicted_malicious=_is_malicious(res.category),
                 expected_escalate=tc.expected_escalate,
                 escalated=_should_escalate_single(res.severity),
+                model_confidence=res.confidence,
                 latency_ms=res.latency_ms,
                 input_tokens=res.input_tokens,
                 output_tokens=res.output_tokens,
+                gemini_input_tokens=res.input_tokens,
+                gemini_output_tokens=res.output_tokens,
+                gemini_thoughts_tokens=res.thoughts_tokens,
             )
         )
     summaries["gemini_only"] = compute_mode_metrics(gemini_records)
@@ -134,6 +140,8 @@ async def run_benchmark(
         g_lat = asm.gemini_result.latency_ms if asm.gemini_result else 0.0
         g_in = asm.gemini_result.input_tokens if asm.gemini_result else 0
         g_out = asm.gemini_result.output_tokens if asm.gemini_result else 0
+        g_tho = asm.gemini_result.thoughts_tokens if asm.gemini_result else 0
+        conf = asm.gemini_result.confidence if asm.gemini_result else asm.subq_result.confidence
         combined_records.append(
             CaseEvalRecord(
                 case_id=tc.case_id,
@@ -147,10 +155,15 @@ async def run_benchmark(
                 predicted_malicious=_is_malicious(asm.final_category),
                 expected_escalate=tc.expected_escalate,
                 escalated=asm.requires_human_approval,
+                model_confidence=conf,
                 models_agreed=asm.models_agreed,
                 latency_ms=round(asm.subq_result.latency_ms + g_lat, 2),
                 input_tokens=asm.subq_result.input_tokens + g_in,
                 output_tokens=g_out,
+                subq_input_tokens=asm.subq_result.input_tokens,
+                gemini_input_tokens=g_in,
+                gemini_output_tokens=g_out,
+                gemini_thoughts_tokens=g_tho,
             )
         )
     summaries["combined"] = compute_mode_metrics(combined_records)
@@ -163,9 +176,13 @@ async def run_benchmark(
         reasoning_client=gemini_client,
         audit_logger=AuditLogger(out_path / "benchmark_audit_routed.jsonl"),
         routing_policy=RoutingPolicy(
-            confidence_threshold=cfg.routing_confidence_threshold,
             escalate_threshold=cfg.routing_escalate_threshold,
             injection_threshold=cfg.routing_injection_threshold,
+            uncertainty_policy=UncertaintyPolicy(
+                confidence_threshold=cfg.routing_confidence_threshold,
+                calibration_margin=cfg.routing_calibration_margin,
+                require_gemini_on_obfuscation=cfg.require_gemini_on_obfuscation,
+            ),
         ),
         enable_intelligent_routing=True,
     )
@@ -174,6 +191,8 @@ async def run_benchmark(
         g_lat = asm.gemini_result.latency_ms if asm.gemini_result else 0.0
         g_in = asm.gemini_result.input_tokens if asm.gemini_result else 0
         g_out = asm.gemini_result.output_tokens if asm.gemini_result else 0
+        g_tho = asm.gemini_result.thoughts_tokens if asm.gemini_result else 0
+        conf = asm.gemini_result.confidence if asm.gemini_result else asm.subq_result.confidence
         routed_records.append(
             CaseEvalRecord(
                 case_id=tc.case_id,
@@ -187,10 +206,15 @@ async def run_benchmark(
                 predicted_malicious=_is_malicious(asm.final_category),
                 expected_escalate=tc.expected_escalate,
                 escalated=asm.requires_human_approval,
+                model_confidence=conf,
                 models_agreed=asm.models_agreed,
                 latency_ms=round(asm.subq_result.latency_ms + g_lat, 2),
                 input_tokens=asm.subq_result.input_tokens + g_in,
                 output_tokens=g_out,
+                subq_input_tokens=asm.subq_result.input_tokens,
+                gemini_input_tokens=g_in,
+                gemini_output_tokens=g_out,
+                gemini_thoughts_tokens=g_tho,
             )
         )
     summaries["routed"] = compute_mode_metrics(routed_records)

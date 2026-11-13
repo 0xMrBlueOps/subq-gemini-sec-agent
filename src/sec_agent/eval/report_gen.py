@@ -16,14 +16,17 @@ def generate_live_markdown_report(csv_path: str | Path, out_md: str | Path) -> P
     lines = [
         "# Live Model Evaluation Report (SubQ Snap 1.2 + Gemini 4 Hydrogen)",
         "",
-        "| Split | Mode | TP / FP / TN / FN | Precision | Recall | Esc Recall | Avg / p95 (ms) | Cost (USD) |",
-        "| :--- | :--- | :--- | ---: | ---: | ---: | :--- | ---: |",
+        "| Split | Mode | TP / FP / TN / FN | Precision | Recall | Esc Recall | Avg / p95 (ms) | Input Tokens | Output Tokens | Thinking Tokens | Cost (USD) |",
+        "| :--- | :--- | :--- | ---: | ---: | ---: | :--- | ---: | ---: | ---: | ---: |",
     ]
     for r in rows:
         cm = f"{r['tp']} / {r['fp']} / {r['tn']} / {r['fn']}"
         lat = f"{r['avg_latency_ms']} / {r['p95_latency_ms']}"
+        in_tok = r.get("total_input_tokens", "0")
+        out_tok = r.get("total_output_tokens", "0")
+        tho_tok = r.get("total_thoughts_tokens", "0")
         lines.append(
-            f"| `{r['split']}` | `{r['mode']}` | {cm} | {r['precision']} | {r['recall']} | {r['escalation_recall']} | {lat} | ${r['estimated_cost_usd']} |"
+            f"| `{r['split']}` | `{r['mode']}` | {cm} | {r['precision']} | {r['recall']} | {r['escalation_recall']} | {lat} | {in_tok} | {out_tok} | {tho_tok} | ${r['estimated_cost_usd']} |"
         )
 
     dest = Path(out_md)

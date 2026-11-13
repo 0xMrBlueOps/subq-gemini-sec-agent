@@ -54,6 +54,15 @@ class GeminiAPIError(RuntimeError):
         self.status_code = status_code
 
 
+def _safe_int(val: Any) -> int:
+    if val is None or isinstance(val, bool):
+        return 0
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _safe_confidence(val: Any) -> float:
     try:
         f = float(val)
@@ -184,7 +193,8 @@ class GeminiHydrogenAdapter(ReasoningModelClient):
         except Exception as exc:
             raise GeminiAPIError(502, f"Malformed Gemini structured payload: {exc}") from exc
 
-        usage = data.get("usageMetadata", {})
+        raw_usage = data.get("usageMetadata")
+        usage = raw_usage if isinstance(raw_usage, dict) else {}
         return GeminiInvestigationResult(
             model=self.model_id,
             category=category,
@@ -194,9 +204,9 @@ class GeminiHydrogenAdapter(ReasoningModelClient):
             recommended_actions=list(parsed.get("recommended_actions", [])),
             uncertainty_notes=list(parsed.get("uncertainty_notes", [])),
             confidence=confidence,
-            input_tokens=int(usage.get("promptTokenCount", 0)),
-            output_tokens=int(usage.get("candidatesTokenCount", 0)),
-            thoughts_tokens=int(usage.get("thoughtsTokenCount", 0)),
+            input_tokens=_safe_int(usage.get("promptTokenCount")),
+            output_tokens=_safe_int(usage.get("candidatesTokenCount")),
+            thoughts_tokens=_safe_int(usage.get("thoughtsTokenCount")),
             latency_ms=latency_ms,
         )
 

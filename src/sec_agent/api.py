@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 
 from sec_agent.audit import AuditLogger
 from sec_agent.config import Settings
-from sec_agent.engine import RoutingPolicy
+from sec_agent.engine import RoutingPolicy, UncertaintyPolicy
 from sec_agent.gateway import (
     DecisionModelClient,
     GeminiHydrogenAdapter,
@@ -34,9 +34,13 @@ def build_orchestrator(settings: Settings) -> TriageOrchestrator:
         )
 
     routing_policy = RoutingPolicy(
-        confidence_threshold=settings.routing_confidence_threshold,
         escalate_threshold=settings.routing_escalate_threshold,
         injection_threshold=settings.routing_injection_threshold,
+        uncertainty_policy=UncertaintyPolicy(
+            confidence_threshold=settings.routing_confidence_threshold,
+            calibration_margin=settings.routing_calibration_margin,
+            require_gemini_on_obfuscation=settings.require_gemini_on_obfuscation,
+        ),
     )
 
     return TriageOrchestrator(

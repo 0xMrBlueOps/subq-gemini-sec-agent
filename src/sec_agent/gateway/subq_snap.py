@@ -40,6 +40,15 @@ class SubQAPIError(RuntimeError):
         self.error_type = error_type
 
 
+def _safe_int(val: Any) -> int:
+    if val is None or isinstance(val, bool):
+        return 0
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _safe_prob(val: Any, default: float = 0.0) -> float:
     try:
         f = float(val)
@@ -185,7 +194,8 @@ class SubQSnapAdapter(DecisionModelClient):
         except Exception as exc:
             raise SubQAPIError(502, f"Malformed SubQ response payload: {exc}") from exc
 
-        usage = data.get("usage", {})
+        raw_usage = data.get("usage")
+        usage = raw_usage if isinstance(raw_usage, dict) else {}
         sev_index = min(3, max(0, round(raw_score)))
         severity = SeverityLevel(_SEVERITY_LEVELS[sev_index])
         severity_score = round(min(10.0, max(0.0, (raw_score / 3.0) * 10.0)), 2)
@@ -203,7 +213,7 @@ class SubQSnapAdapter(DecisionModelClient):
             escalate_probability=escalate_prob,
             prompt_injection_probability=inj_prob,
             confidence=confidence,
-            input_tokens=int(usage.get("input_tokens", 0)),
+            input_tokens=_safe_int(usage.get("input_tokens")),
             latency_ms=latency_ms,
         )
 
