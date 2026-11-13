@@ -1,0 +1,5 @@
+mode,execution_type,total_cases,precision,recall,false_positive_rate,false_negative_rate,category_accuracy,severity_agreement,escalation_recall,avg_latency_ms,total_input_tokens,total_output_tokens
+subq_only,mock,25,0.7895,1.0,0.4,0.0,0.84,0.8,0.9333,45.0,3500,0
+gemini_only,mock,25,1.0,1.0,0.0,0.0,1.0,1.0,0.7333,205.2,6840,2715
+combined,mock,25,1.0,1.0,0.0,0.0,1.0,0.8,1.0,250.2,10340,2715
+routed,mock,25,1.0,1.0,0.0,0.0,1.0,0.8,1.0,202.2,8740,2105
