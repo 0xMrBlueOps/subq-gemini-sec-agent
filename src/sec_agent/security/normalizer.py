@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import re
 import unicodedata
+from urllib.parse import unquote
 from dataclasses import dataclass, field
 
 _ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\ufeff\u00ad]")
@@ -54,7 +55,10 @@ def normalize_telemetry(raw_text: str) -> NormalizedTelemetry:
     if deobfuscated != no_zw:
         signals.append("caret_or_backtick_obfuscation")
 
-    collapsed = re.sub(r"[ \t]+", " ", deobfuscated)
+    unquoted = unquote(deobfuscated)
+    if unquoted != deobfuscated:
+        signals.append("url_encoding_decoded")
+    collapsed = re.sub(r"[ 	]+", " ", unquoted)
 
     if _CHAINING_RE.search(collapsed):
         signals.append("command_chaining_detected")

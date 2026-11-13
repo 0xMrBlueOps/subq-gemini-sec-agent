@@ -213,7 +213,7 @@ class MockSubQSnapClient(DecisionModelClient):
                 severity, score, escalate, conf = SeverityLevel.CRITICAL, 9.3, 0.95, 0.92
             else:
                 severity, score, escalate, conf = SeverityLevel.MEDIUM, 5.5, 0.61, 0.63
-        elif "impossible travel" in text or "anonymous proxy" in text or "neighboring city" in text or "london heathrow" in text:
+        elif "impossible travel" in text or "tor exit node" in text or "anonymous proxy" in text or "neighboring city" in text or "london heathrow" in text:
             category = ThreatCategory.SUSPICIOUS_LOGIN
             if "tor exit node" in text:
                 severity, score, escalate, conf = SeverityLevel.CRITICAL, 9.6, 0.98, 0.95

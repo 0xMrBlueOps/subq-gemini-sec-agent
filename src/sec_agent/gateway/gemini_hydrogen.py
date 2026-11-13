@@ -143,7 +143,8 @@ class MockGeminiHydrogenClient(ReasoningModelClient):
     async def investigate_event(self, event: SecurityEvent, isolated_log: str) -> GeminiInvestigationResult:
         text = isolated_log.lower()
 
-        if any(marker in text for marker in ["authorized", "chg-", "trv-", "scheduled nightly s3 backup", "signed by corpit", "accepted publickey"]):
+        has_high_impact = any(k in text for k in ["/etc/sudoers", "/etc/shadow", "customer_dump", "winword.exe", "tor exit node", "nopasswd:all", "198.51.100."])
+        if not has_high_impact and any(marker in text for marker in ["authorized", "chg-", "trv-", "scheduled nightly s3 backup", "signed by corpit", "accepted publickey"]):
             return GeminiInvestigationResult(
                 model="gemini-4-hydrogen-mock",
                 category=ThreatCategory.BENIGN,

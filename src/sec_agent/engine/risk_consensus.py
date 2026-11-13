@@ -4,6 +4,7 @@ from sec_agent.schemas import (
     SecurityEvent,
     SeverityLevel,
     SubQTriageResult,
+    ThreatCategory,
 )
 from sec_agent.security.guardrails import HumanApprovalGate
 
@@ -24,7 +25,7 @@ def evaluate_consensus(
     routing_decision: str = "escalated_to_gemini",
     routing_reasons: list[str] | None = None,
 ) -> ConsensusAssessment:
-    """Compare SubQ Snap and optional Gemini outputs, compute risk score, and gate high-risk decisions."""
+    """Compare SubQ Snap and optional Gemini outputs; never let BENIGN override a detected threat on disagreement."""
     disagreements: list[str] = []
     reasons_list = routing_reasons or []
 
@@ -41,13 +42,20 @@ def evaluate_consensus(
             disagreements.append(f"severity_mismatch: subq={subq.severity.value} vs gemini={gemini.severity.value}")
 
         models_agreed = len(disagreements) == 0
-        # Conservative severity selection; disagreements trigger human investigation rather than averaging
-        final_severity = (
-            subq.severity
-            if _SEVERITY_RANK[subq.severity] >= _SEVERITY_RANK[gemini.severity]
-            else gemini.severity
-        )
-        final_category = gemini.category if not models_agreed else subq.category
+        subq_rank = _SEVERITY_RANK[subq.severity]
+        gem_rank = _SEVERITY_RANK[gemini.severity]
+        final_severity = subq.severity if subq_rank >= gem_rank else gemini.severity
+
+        if models_agreed:
+            final_category = subq.category
+        elif gemini.category == ThreatCategory.BENIGN and subq.category != ThreatCategory.BENIGN:
+            # Never allow a BENIGN classification to erase a threat flagged by SubQ
+            final_category = subq.category
+        elif subq.category == ThreatCategory.BENIGN and gemini.category != ThreatCategory.BENIGN:
+            final_category = gemini.category
+        else:
+            final_category = subq.category if subq_rank >= gem_rank else gemini.category
+
         avg_confidence = (subq.confidence + gemini.confidence) / 2.0
 
     risk_score = round(min(100.0, (subq.severity_score * 10.0) * (0.5 + 0.5 * avg_confidence)), 2)

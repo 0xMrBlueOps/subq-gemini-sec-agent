@@ -12,9 +12,10 @@ class ToolPermissionPolicy:
 
     @staticmethod
     def is_tool_allowed(tool_name: str) -> bool:
-        if tool_name in CONSEQUENTIAL_ACTIONS:
+        normalized = tool_name.strip().lower()
+        if normalized in CONSEQUENTIAL_ACTIONS:
             return False
-        return tool_name in ALLOWED_READONLY_TOOLS
+        return normalized in ALLOWED_READONLY_TOOLS
 
 
 class HumanApprovalGate:
