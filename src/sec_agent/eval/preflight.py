@@ -36,7 +36,9 @@ async def run_preflight(settings: Settings | None = None, check_network: bool = 
             "subq_base_url": cfg.subq_base_url,
             "subq_model_id": cfg.subq_model_id,
             "gemini_api_key": _mask_secret_status(cfg.gemini_api_key),
+            "gemini_base_url": cfg.gemini_base_url,
             "gemini_model_id": cfg.gemini_model_id,
+            "gemini_thinking_level": cfg.gemini_thinking_level,
             "use_mock_models": cfg.use_mock_models,
         },
         "connectivity": {
@@ -61,7 +63,7 @@ async def run_preflight(settings: Settings | None = None, check_network: bool = 
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 r = await client.get(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{cfg.gemini_model_id}",
+                    f"{cfg.gemini_base_url.rstrip('/')}/models/{cfg.gemini_model_id}",
                     headers={"x-goog-api-key": cfg.gemini_api_key},
                 )
             report["connectivity"]["gemini"] = f"http_{r.status_code}"

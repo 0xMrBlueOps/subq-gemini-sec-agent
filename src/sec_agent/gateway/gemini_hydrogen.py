@@ -20,10 +20,34 @@ _SYSTEM_PROMPT = (
 )
 
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+_VALID_THINKING_LEVELS = frozenset({"LOW", "MEDIUM", "HIGH", "XHIGH"})
+_BLOCKED_FINISH_REASONS = frozenset({"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII"})
+
+_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "category": {"type": "STRING", "enum": [c.value for c in ThreatCategory]},
+        "severity": {"type": "STRING", "enum": [s.value for s in SeverityLevel]},
+        "summary": {"type": "STRING"},
+        "indicators_of_compromise": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "recommended_actions": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "uncertainty_notes": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "confidence": {"type": "NUMBER"},
+    },
+    "required": [
+        "category",
+        "severity",
+        "summary",
+        "indicators_of_compromise",
+        "recommended_actions",
+        "uncertainty_notes",
+        "confidence",
+    ],
+}
 
 
 class GeminiAPIError(RuntimeError):
-    """Raised when Gemini API returns an error status or malformed payload."""
+    """Raised when Gemini API returns an error status, safety block, or malformed payload."""
 
     def __init__(self, status_code: int, message: str) -> None:
         super().__init__(f"Gemini API error ({status_code}): {message}")
@@ -40,24 +64,39 @@ def _safe_confidence(val: Any) -> float:
         return 0.0
 
 
+def _parse_retry_after(resp: httpx.Response, default_delay: float, cap_seconds: float = 30.0) -> float:
+    raw = resp.headers.get("Retry-After")
+    if raw:
+        try:
+            return min(cap_seconds, max(0.0, float(raw.strip())))
+        except ValueError:
+            pass
+    return min(cap_seconds, default_delay)
+
+
 class GeminiHydrogenAdapter(ReasoningModelClient):
-    """Live adapter for Gemini 4 Hydrogen (gemini-4-hydrogen) with bounded retries."""
+    """Live adapter for Gemini 4 Hydrogen (gemini-4-hydrogen) via REST generateContent."""
 
     def __init__(
         self,
         api_key: str,
         model_id: str = "gemini-4-hydrogen",
         base_url: str = "https://generativelanguage.googleapis.com/v1beta",
+        thinking_level: str = "LOW",
         timeout_seconds: float = 45.0,
         max_retries: int = 2,
-        retry_backoff_seconds: float = 0.25,
+        retry_backoff_seconds: float = 1.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         if not api_key:
             raise ValueError("GEMINI_API_KEY is required for live GeminiHydrogenAdapter.")
+        level = thinking_level.strip().upper()
+        if level not in _VALID_THINKING_LEVELS:
+            raise ValueError(f"Unsupported thinking_level '{thinking_level}'. Must be one of {sorted(_VALID_THINKING_LEVELS)}.")
         self.api_key = api_key
         self.model_id = model_id
         self.base_url = base_url.rstrip("/")
+        self.thinking_level = level
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.retry_backoff_seconds = retry_backoff_seconds
@@ -77,7 +116,8 @@ class GeminiHydrogenAdapter(ReasoningModelClient):
             "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
             "generationConfig": {
                 "responseMimeType": "application/json",
-                "temperature": 0.1,
+                "responseSchema": _RESPONSE_SCHEMA,
+                "thinkingConfig": {"thinkingLevel": self.thinking_level},
             },
         }
 
@@ -94,15 +134,17 @@ class GeminiHydrogenAdapter(ReasoningModelClient):
 
         async with httpx.AsyncClient(timeout=self.timeout_seconds, transport=self.transport) as client:
             for attempt in range(self.max_retries + 1):
+                delay = self.retry_backoff_seconds * (2**attempt)
                 try:
                     resp = await client.post(url, headers=headers, json=payload)
                     if resp.status_code not in _RETRYABLE_STATUS or attempt == self.max_retries:
                         break
+                    delay = _parse_retry_after(resp, delay)
                 except (httpx.TimeoutException, httpx.ConnectError) as exc:
                     last_exc = exc
                     if attempt == self.max_retries:
                         raise GeminiAPIError(504, f"Gemini request failed after {attempt + 1} attempts: {exc}") from exc
-                await asyncio.sleep(self.retry_backoff_seconds * (2**attempt))
+                await asyncio.sleep(delay)
 
         latency_ms = round((time.perf_counter() - start) * 1000.0, 2)
         if resp is None:
@@ -112,14 +154,35 @@ class GeminiHydrogenAdapter(ReasoningModelClient):
 
         try:
             data = resp.json()
-            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-            parsed = json.loads(raw_text)
+        except Exception as exc:
+            raise GeminiAPIError(502, f"Malformed Gemini JSON response: {exc}") from exc
+
+        block_reason = data.get("promptFeedback", {}).get("blockReason")
+        if block_reason:
+            raise GeminiAPIError(422, f"Prompt blocked by safety filter: {block_reason}")
+
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise GeminiAPIError(502, "Gemini returned zero candidates.")
+
+        candidate = candidates[0]
+        finish_reason = str(candidate.get("finishReason", ""))
+        if finish_reason in _BLOCKED_FINISH_REASONS:
+            raise GeminiAPIError(422, f"Response blocked (finishReason={finish_reason})")
+
+        parts = candidate.get("content", {}).get("parts", [])
+        text_chunks = [p["text"] for p in parts if isinstance(p, dict) and "text" in p and not p.get("thought")]
+        if not text_chunks:
+            raise GeminiAPIError(502, f"No output text parts in Gemini candidate (finishReason={finish_reason or 'unknown'})")
+
+        try:
+            parsed = json.loads("".join(text_chunks))
             category = ThreatCategory(parsed["category"])
             severity = SeverityLevel(parsed["severity"])
             summary = str(parsed["summary"])
             confidence = _safe_confidence(parsed.get("confidence"))
         except Exception as exc:
-            raise GeminiAPIError(502, f"Malformed Gemini response payload: {exc}") from exc
+            raise GeminiAPIError(502, f"Malformed Gemini structured payload: {exc}") from exc
 
         usage = data.get("usageMetadata", {})
         return GeminiInvestigationResult(
@@ -133,6 +196,7 @@ class GeminiHydrogenAdapter(ReasoningModelClient):
             confidence=confidence,
             input_tokens=int(usage.get("promptTokenCount", 0)),
             output_tokens=int(usage.get("candidatesTokenCount", 0)),
+            thoughts_tokens=int(usage.get("thoughtsTokenCount", 0)),
             latency_ms=latency_ms,
         )
 
@@ -156,6 +220,7 @@ class MockGeminiHydrogenClient(ReasoningModelClient):
                 confidence=0.90,
                 input_tokens=260,
                 output_tokens=95,
+                thoughts_tokens=0,
                 latency_ms=195.0,
             )
 
@@ -210,5 +275,6 @@ class MockGeminiHydrogenClient(ReasoningModelClient):
             confidence=conf,
             input_tokens=280,
             output_tokens=115,
+            thoughts_tokens=0,
             latency_ms=210.0,
         )

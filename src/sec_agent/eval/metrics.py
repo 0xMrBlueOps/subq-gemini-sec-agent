@@ -4,7 +4,7 @@ from pydantic import BaseModel
 
 # Verified public pricing (Nov 2026):
 # SubQ Snap 1.2: $0.04 / 1M input tokens, $0 output
-# Gemini 4 Hydrogen: $1.50 / 1M input tokens, $7.50 / 1M output tokens
+# Gemini 4 Hydrogen: $1.50 / 1M input tokens, $7.50 / 1M output tokens (thoughtsTokenCount billed at output rate)
 SUBQ_INPUT_PER_1M = 0.04
 GEMINI_INPUT_PER_1M = 1.50
 GEMINI_OUTPUT_PER_1M = 7.50
@@ -32,6 +32,7 @@ class CaseEvalRecord(BaseModel):
     subq_input_tokens: int = 0
     gemini_input_tokens: int = 0
     gemini_output_tokens: int = 0
+    gemini_thoughts_tokens: int = 0
 
 
 class ModeMetrics(BaseModel):
@@ -57,6 +58,7 @@ class ModeMetrics(BaseModel):
     p95_latency_ms: float
     total_input_tokens: int
     total_output_tokens: int
+    total_thoughts_tokens: int = 0
     estimated_cost_usd: float
 
 
@@ -103,7 +105,6 @@ def compute_mode_metrics(records: list[CaseEvalRecord]) -> ModeMetrics:
         else 1.0
     )
 
-    # Brier score on category correctness vs reported confidence
     brier = round(
         sum(
             (r.model_confidence - (1.0 if r.expected_category == r.predicted_category else 0.0)) ** 2
@@ -120,6 +121,7 @@ def compute_mode_metrics(records: list[CaseEvalRecord]) -> ModeMetrics:
 
     tot_in = sum(r.input_tokens for r in records)
     tot_out = sum(r.output_tokens for r in records)
+    tot_thoughts = sum(r.gemini_thoughts_tokens for r in records)
 
     subq_in = sum(r.subq_input_tokens for r in records)
     gem_in = sum(r.gemini_input_tokens for r in records)
@@ -130,10 +132,11 @@ def compute_mode_metrics(records: list[CaseEvalRecord]) -> ModeMetrics:
         elif mode == "gemini_only":
             gem_in, gem_out = tot_in, tot_out
 
+    # thoughtsTokenCount is tracked separately and included exactly once at Gemini output rate
     cost = (
         (subq_in / 1_000_000.0) * SUBQ_INPUT_PER_1M
         + (gem_in / 1_000_000.0) * GEMINI_INPUT_PER_1M
-        + (gem_out / 1_000_000.0) * GEMINI_OUTPUT_PER_1M
+        + ((gem_out + tot_thoughts) / 1_000_000.0) * GEMINI_OUTPUT_PER_1M
     )
 
     return ModeMetrics(
@@ -159,5 +162,6 @@ def compute_mode_metrics(records: list[CaseEvalRecord]) -> ModeMetrics:
         p95_latency_ms=p95_lat,
         total_input_tokens=tot_in,
         total_output_tokens=tot_out,
+        total_thoughts_tokens=tot_thoughts,
         estimated_cost_usd=round(cost, 6),
     )

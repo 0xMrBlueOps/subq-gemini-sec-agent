@@ -60,6 +60,8 @@ async def run_benchmark(
         gemini_client = GeminiHydrogenAdapter(
             api_key=cfg.gemini_api_key or "",
             model_id=cfg.gemini_model_id,
+            base_url=cfg.gemini_base_url,
+            thinking_level=cfg.gemini_thinking_level,
         )
 
     dataset = build_synthetic_dataset()

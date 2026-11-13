@@ -60,6 +60,7 @@ class GeminiInvestigationResult(BaseModel):
     confidence: float = Field(..., ge=0.0, le=1.0)
     input_tokens: int = 0
     output_tokens: int = 0
+    thoughts_tokens: int = 0
     latency_ms: float = 0.0
 
 

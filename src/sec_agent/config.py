@@ -20,7 +20,13 @@ class Settings(BaseModel):
     subq_model_id: str = Field(default_factory=lambda: os.getenv("SUBQ_MODEL_ID", "subq-snap-1.2"))
 
     gemini_api_key: str | None = Field(default_factory=lambda: os.getenv("GEMINI_API_KEY"))
+    gemini_base_url: str = Field(
+        default_factory=lambda: os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
+    )
     gemini_model_id: str = Field(default_factory=lambda: os.getenv("GEMINI_MODEL_ID", "gemini-4-hydrogen"))
+    gemini_thinking_level: str = Field(
+        default_factory=lambda: os.getenv("GEMINI_THINKING_LEVEL", "LOW").strip().upper()
+    )
 
     use_mock_models: bool = Field(default_factory=lambda: _env_bool("USE_MOCK_MODELS", True))
     audit_log_path: str = Field(default_factory=lambda: os.getenv("AUDIT_LOG_PATH", "audit_logs/decisions.jsonl"))

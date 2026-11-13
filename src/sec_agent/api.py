@@ -29,6 +29,8 @@ def build_orchestrator(settings: Settings) -> TriageOrchestrator:
         reasoning_client = GeminiHydrogenAdapter(
             api_key=settings.gemini_api_key or "",
             model_id=settings.gemini_model_id,
+            base_url=settings.gemini_base_url,
+            thinking_level=settings.gemini_thinking_level,
         )
 
     routing_policy = RoutingPolicy(

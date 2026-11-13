@@ -106,6 +106,7 @@ async def _evaluate_split(
                 output_tokens=res.output_tokens,
                 gemini_input_tokens=res.input_tokens,
                 gemini_output_tokens=res.output_tokens,
+                gemini_thoughts_tokens=res.thoughts_tokens,
             )
         )
     summaries.append(compute_mode_metrics(gem_recs))
@@ -124,6 +125,7 @@ async def _evaluate_split(
         g_lat = asm.gemini_result.latency_ms if asm.gemini_result else 0.0
         g_in = asm.gemini_result.input_tokens if asm.gemini_result else 0
         g_out = asm.gemini_result.output_tokens if asm.gemini_result else 0
+        g_tho = asm.gemini_result.thoughts_tokens if asm.gemini_result else 0
         conf = asm.gemini_result.confidence if asm.gemini_result else asm.subq_result.confidence
         comb_recs.append(
             CaseEvalRecord(
@@ -148,6 +150,7 @@ async def _evaluate_split(
                 subq_input_tokens=asm.subq_result.input_tokens,
                 gemini_input_tokens=g_in,
                 gemini_output_tokens=g_out,
+                gemini_thoughts_tokens=g_tho,
             )
         )
     summaries.append(compute_mode_metrics(comb_recs))
@@ -175,6 +178,7 @@ async def _evaluate_split(
         g_lat = asm.gemini_result.latency_ms if asm.gemini_result else 0.0
         g_in = asm.gemini_result.input_tokens if asm.gemini_result else 0
         g_out = asm.gemini_result.output_tokens if asm.gemini_result else 0
+        g_tho = asm.gemini_result.thoughts_tokens if asm.gemini_result else 0
         conf = asm.gemini_result.confidence if asm.gemini_result else asm.subq_result.confidence
         routed_recs.append(
             CaseEvalRecord(
@@ -199,6 +203,7 @@ async def _evaluate_split(
                 subq_input_tokens=asm.subq_result.input_tokens,
                 gemini_input_tokens=g_in,
                 gemini_output_tokens=g_out,
+                gemini_thoughts_tokens=g_tho,
             )
         )
     summaries.append(compute_mode_metrics(routed_recs))
@@ -222,7 +227,7 @@ async def run_phase9_benchmark(
         gemini_client: ReasoningModelClient = MockGeminiHydrogenClient()
     else:
         subq_client = SubQSnapAdapter(api_key=cfg.subq_api_key or "", base_url=cfg.subq_base_url, model_id=cfg.subq_model_id)
-        gemini_client = GeminiHydrogenAdapter(api_key=cfg.gemini_api_key or "", model_id=cfg.gemini_model_id)
+        gemini_client = GeminiHydrogenAdapter(api_key=cfg.gemini_api_key or "", model_id=cfg.gemini_model_id, base_url=cfg.gemini_base_url, thinking_level=cfg.gemini_thinking_level)
 
     full_ds = build_phase9_dataset()
     dev_cases = [c for c in full_ds if c.split.value == "dev"]

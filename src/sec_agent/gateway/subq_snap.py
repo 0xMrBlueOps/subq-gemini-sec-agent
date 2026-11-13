@@ -34,9 +34,10 @@ _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 class SubQAPIError(RuntimeError):
     """Raised when SubQ Decisions API returns an error status or malformed payload."""
 
-    def __init__(self, status_code: int, message: str) -> None:
+    def __init__(self, status_code: int, message: str, error_type: str | None = None) -> None:
         super().__init__(f"SubQ API error ({status_code}): {message}")
         self.status_code = status_code
+        self.error_type = error_type
 
 
 def _safe_prob(val: Any, default: float = 0.0) -> float:
@@ -49,8 +50,33 @@ def _safe_prob(val: Any, default: float = 0.0) -> float:
         return default
 
 
+def _parse_retry_after(resp: httpx.Response, default_delay: float, cap_seconds: float = 30.0) -> float:
+    raw = resp.headers.get("Retry-After")
+    if raw:
+        try:
+            return min(cap_seconds, max(0.0, float(raw.strip())))
+        except ValueError:
+            pass
+    return min(cap_seconds, default_delay)
+
+
+def _format_subq_error(resp: httpx.Response) -> tuple[str, str | None]:
+    try:
+        body = resp.json()
+        detail = body.get("detail")
+        if isinstance(detail, dict):
+            err_type = str(detail.get("error_type", "api_error"))
+            msg = str(detail.get("message", resp.text[:300]))
+            return f"{err_type}: {msg}", err_type
+        if detail is not None:
+            return str(detail)[:500], None
+    except Exception:
+        pass
+    return resp.text[:500], None
+
+
 class SubQSnapAdapter(DecisionModelClient):
-    """Live adapter for SubQ Decisions API (POST /v1/systemone) with bounded retries."""
+    """Live adapter for SubQ Decisions API (POST /v1/systemone) with Retry-After & bounded backoff."""
 
     def __init__(
         self,
@@ -59,7 +85,7 @@ class SubQSnapAdapter(DecisionModelClient):
         model_id: str = "subq-snap-1.2",
         timeout_seconds: float = 30.0,
         max_retries: int = 2,
-        retry_backoff_seconds: float = 0.25,
+        retry_backoff_seconds: float = 1.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         if not api_key:
@@ -126,21 +152,24 @@ class SubQSnapAdapter(DecisionModelClient):
 
         async with httpx.AsyncClient(timeout=self.timeout_seconds, transport=self.transport) as client:
             for attempt in range(self.max_retries + 1):
+                delay = self.retry_backoff_seconds * (2**attempt)
                 try:
                     resp = await client.post(f"{self.base_url}/systemone", headers=headers, json=payload)
                     if resp.status_code not in _RETRYABLE_STATUS or attempt == self.max_retries:
                         break
+                    delay = _parse_retry_after(resp, delay)
                 except (httpx.TimeoutException, httpx.ConnectError) as exc:
                     last_exc = exc
                     if attempt == self.max_retries:
                         raise SubQAPIError(504, f"SubQ request failed after {attempt + 1} attempts: {exc}") from exc
-                await asyncio.sleep(self.retry_backoff_seconds * (2**attempt))
+                await asyncio.sleep(delay)
 
         latency_ms = round((time.perf_counter() - start) * 1000.0, 2)
         if resp is None:
             raise SubQAPIError(503, f"SubQ request produced no response: {last_exc}")
         if resp.status_code >= 400:
-            raise SubQAPIError(resp.status_code, resp.text[:500])
+            msg, err_type = _format_subq_error(resp)
+            raise SubQAPIError(resp.status_code, msg, error_type=err_type)
 
         try:
             data = resp.json()
@@ -161,7 +190,6 @@ class SubQSnapAdapter(DecisionModelClient):
         severity = SeverityLevel(_SEVERITY_LEVELS[sev_index])
         severity_score = round(min(10.0, max(0.0, (raw_score / 3.0) * 10.0)), 2)
 
-        # Missing or invalid confidence defaults to 0.0 so HumanApprovalGate escalates safely
         cat_conf = _safe_prob(cat_ans.get("confidence"), default=0.0)
         sev_conf = _safe_prob(sev_ans.get("confidence"), default=0.0)
         confidence = round(min(cat_conf, sev_conf), 4)
