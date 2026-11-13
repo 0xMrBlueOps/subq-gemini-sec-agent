@@ -10,3 +10,6 @@ venv/
 .env
 *.jsonl
 audit_logs/
+
+# Local live evaluation outputs
+eval_results/phase13_live_*/
